@@ -347,6 +347,7 @@ extern "C" {
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
         bool load_mtp;        // whether to load MTP layers
+        int8_t cw;            // load-time compressed weight cache (Q4_0) for matching tensors. 0 = off, 1 = on (default), -1 = auto (on iff model has any matching downgrade candidate). Forces no-mmap when active.
     };
 
     struct llama_sampler_seq_config {

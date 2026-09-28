@@ -2717,6 +2717,7 @@ llama_model_params llama_model_default_params() {
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
         /*.load_mtp                    =*/ false,
+        /*.cw                          =*/ -1,  // auto by default: on for Intel Xe2+, off elsewhere
     };
 
     return result;

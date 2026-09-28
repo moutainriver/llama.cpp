@@ -316,8 +316,29 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
 static std::pair<int, llama_model *> llama_model_load(struct gguf_context * metadata, llama_model_set_tensor_data_t set_tensor_data, void * set_tensor_data_ud,
         const std::string & fname, std::vector<std::string> & splits, FILE * file, llama_model_params & params) {
     try {
+        // Resolve cw auto-mode: enable on Intel Xe2 (let loader check for matching candidates), off elsewhere.
+        if (params.cw == -1) {
+            bool is_intel_xe2 = false;
+            auto * vk_reg = ggml_backend_reg_by_name("Vulkan");
+            if (vk_reg) {
+                using is_intel_xe2_fn_t = bool (*)(int);
+                auto is_intel_xe2_fn = (is_intel_xe2_fn_t) ggml_backend_reg_get_proc_address(vk_reg, "ggml_backend_vk_is_intel_xe2");
+                if (is_intel_xe2_fn) {
+                    int n = (int) ggml_backend_reg_dev_count(vk_reg);
+                    for (int i = 0; i < n; i++) {
+                        if (is_intel_xe2_fn(i)) { is_intel_xe2 = true; break; }
+                    }
+                }
+            }
+            if (is_intel_xe2) {
+                params.cw = 1;
+            } else {
+                params.cw = 0;
+            }
+        }
+
         llama_model_loader ml(metadata, set_tensor_data, set_tensor_data_ud, fname, splits, file, params.load_mode,
-            params.check_tensors, params.no_alloc, params.load_mtp, params.kv_overrides, params.tensor_buft_overrides);
+            params.check_tensors, params.no_alloc, params.load_mtp, params.kv_overrides, params.tensor_buft_overrides, params.cw);
 
         ml.lazy.mode = params.lazy_mode;
 

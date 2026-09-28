@@ -239,35 +239,50 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
 #elif defined(DATA_A_Q4_K)
             const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
 
-            const uint ib = idx / 64;                  // 4 values per idx
-            const uint iqs = (idx % 64) * 2;           // 0,2,4..126
+            const uint ib  = idx / 64;                    // 4 values per idx
+            const uint iqs = (idx % 64) * 2;              // 0,2,4..126
 
-            const uint n = iqs / 32;                   // 0,1,2,3
-            const uint b = (iqs % 32) / 16;            // 0,1
-            const uint is = 2 * n + b;                 // 0..7
-            const uint qsi = n * 32 + (iqs % 16) * 2;  // 0,2,4..126
+            const uint n   = iqs / 32;                    // 0,1,2,3
+            const uint b   = (iqs % 32) / 16;             // 0,1
+            const uint is  = 2u * n + b;                  // 0..7
+            const uint j   = is & 3u;                     // low 2 bits: 0..3
+            const int  jsh = int(j * 8u);                 // byte bit-offset: 0,8,16,24
+            const uint qsi = n * 32u + (iqs % 16u) * 2u; // 0,2,4..126
 
-            const vec2 loadd = vec2(data_a[ib].dm);
+            const vec2 loadd = vec2(data_a_packed32[ib].dm);
 
-            const uvec3 scales = uvec3(data_a_packed32[ib].scales[0],
-                                       data_a_packed32[ib].scales[1],
-                                       data_a_packed32[ib].scales[2]);
-            const uint scalesoffs = (is & 3) * 8;
+            // Q4_K scales: 12 bytes packed as 3 uint32 words.
+            // Decode 6-bit sc and mbyte via bitfieldExtract — avoids 4 scattered byte reads and
+            // 10 runtime ternaries. The condition (is < 4u) is warp-uniform (stride_a/LOAD_VEC_A
+            // is a multiple of 64), so this branch compiles to a uniform predicate with no divergence.
+            //   sw0 = scales[0..3], sw1 = scales[4..7], sw2 = scales[8..11]
+            //   is<4: sc   = sw0[j] bits[0:5];   mbyte = sw1[j] bits[0:5]
+            //   is≥4: sc   = sw2[j] bits[0:3] | sw0[j] bits[6:7]<<4
+            //         mbyte = sw2[j] bits[4:7] | sw1[j] bits[6:7]<<4
+            const uint sw0 = data_a_packed32[ib].scales[0];
+            const uint sw1 = data_a_packed32[ib].scales[1];
+            const uint sw2 = data_a_packed32[ib].scales[2];
 
-            const uint scidx0 = (is < 4) ? 0 : 2;
-            const uint scidxshift0 = scalesoffs;
-            const uint scidxshift1 = (is < 4) ? scalesoffs : scalesoffs + 2;
-            const uint mbidx0 = (is < 4) ? 1 : 2;
-            const uint mbidxshift0 = (is < 4) ? scalesoffs : scalesoffs + 4;
-            const uint mbidxshift1 = (is < 4) ? scalesoffs : scalesoffs + 2;
+            uint sc, mbyte;
+            if (is < 4u) {
+                sc    = bitfieldExtract(sw0, jsh,     6);
+                mbyte = bitfieldExtract(sw1, jsh,     6);
+            } else {
+                sc    = bitfieldExtract(sw2, jsh,     4) | (bitfieldExtract(sw0, jsh + 6, 2) << 4u);
+                mbyte = bitfieldExtract(sw2, jsh + 4, 4) | (bitfieldExtract(sw1, jsh + 6, 2) << 4u);
+            }
 
-            const uint8_t sc    = uint8_t(((scales[scidx0] >> scidxshift0) & 0xF) | ((scales[0] >> scidxshift1) & 0x30));
-            const uint8_t mbyte = uint8_t(((scales[mbidx0] >> mbidxshift0) & 0xF) | ((scales[1] >> mbidxshift1) & 0x30));
+            const float d = loadd.x * float(sc);
+            const float m = -loadd.y * float(mbyte);
 
-            const float d = loadd.x * sc;
-            const float m = -loadd.y * mbyte;
-
-            const vec4 q = vec4(unpack8((data_a_packed32[ib].qs[qsi / 4] >> (b * 4)) & 0x0F0F0F0F));
+            // Nibble decode: 4× bitfieldExtract avoids byte-register scatter/gather chain
+            // (shr + and 0x0F0F0F0F + 4×mov:b + 4×mov:ub→uw + 4×itof → 4×bfe + 4×itof)
+            const uint qs_word = data_a_packed32[ib].qs[qsi / 4];
+            const int base = int(b * 4u);  // 0 or 4, per-lane
+            const vec4 q = vec4(float(bitfieldExtract(qs_word, base,      4)),
+                                float(bitfieldExtract(qs_word, base + 8,  4)),
+                                float(bitfieldExtract(qs_word, base + 16, 4)),
+                                float(bitfieldExtract(qs_word, base + 24, 4)));
 
             const uint k_pair = row * LOAD_VEC_A / 2;
             store_a(col, k_pair,     FLOAT_TYPEV2(fma(d, q.x, m), fma(d, q.y, m)));
@@ -284,25 +299,26 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
             const uint qsi = n * 32 + (iqs % 16) * 2;  // 0,2,4..126
             const uint qhi = (iqs % 16) * 2;           // 0,2,4..30
 
-            const vec2 loadd = vec2(data_a[ib].dm);
+            // OPT: bitfieldExtract scale decode (same layout as Q4_K, avoids 10 ternaries + 4 byte reads)
+            const vec2 loadd = vec2(data_a_packed32[ib].dm);
 
-            const uvec3 scales = uvec3(data_a_packed32[ib].scales[0],
-                                       data_a_packed32[ib].scales[1],
-                                       data_a_packed32[ib].scales[2]);
-            const uint scalesoffs = (is & 3) * 8;
+            const uint j   = is & 3u;
+            const int  jsh = int(j * 8u);
+            const uint sw0 = data_a_packed32[ib].scales[0];
+            const uint sw1 = data_a_packed32[ib].scales[1];
+            const uint sw2 = data_a_packed32[ib].scales[2];
 
-            const uint scidx0 = (is < 4) ? 0 : 2;
-            const uint scidxshift0 = scalesoffs;
-            const uint scidxshift1 = (is < 4) ? scalesoffs : scalesoffs + 2;
-            const uint mbidx0 = (is < 4) ? 1 : 2;
-            const uint mbidxshift0 = (is < 4) ? scalesoffs : scalesoffs + 4;
-            const uint mbidxshift1 = (is < 4) ? scalesoffs : scalesoffs + 2;
+            uint sc, mbyte;
+            if (is < 4u) {
+                sc    = bitfieldExtract(sw0, jsh,     6);
+                mbyte = bitfieldExtract(sw1, jsh,     6);
+            } else {
+                sc    = bitfieldExtract(sw2, jsh,     4) | (bitfieldExtract(sw0, jsh + 6, 2) << 4u);
+                mbyte = bitfieldExtract(sw2, jsh + 4, 4) | (bitfieldExtract(sw1, jsh + 6, 2) << 4u);
+            }
 
-            const uint8_t sc    = uint8_t(((scales[scidx0] >> scidxshift0) & 0xF) | ((scales[0] >> scidxshift1) & 0x30));
-            const uint8_t mbyte = uint8_t(((scales[mbidx0] >> mbidxshift0) & 0xF) | ((scales[1] >> mbidxshift1) & 0x30));
-
-            const float d = loadd.x * sc;
-            const float m = -loadd.y * mbyte;
+            const float d = loadd.x * float(sc);
+            const float m = -loadd.y * float(mbyte);
 
             const uint qs = (data_a_packed32[ib].qs[qsi / 4] >> (b * 4)) & 0x0F0F0F0F;
             const uint qh = ((data_a_packed32[ib].qh[qhi / 4] >> (iqs / 16)) & 0x01010101) << 4;
@@ -544,7 +560,6 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
 
             const uint vui = uint(data_a[ib].qs[iqs]);
             const uint vui2 = uint(data_a[ib].qs[iqs+1]);
-
 #ifdef USE_OCP_FP4
             const float d = e8m0_to_fp32(data_a[ib].e);
             const u8vec2 packed = u8vec2(vui, vui2);
@@ -552,10 +567,18 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
             store_a(col, row + 8, FLOAT_TYPEV2(bitcastExtractfe2m1EXT(packed, 4u)) * FLOAT_TYPE(d));
 #else
             const float d = e8m0_to_fp32(data_a[ib].e) * 0.5;
-            store_a(col, row,     FLOAT_TYPEV2(kvalues_mxfp4[vui  & 0xF] * d,
-                                              kvalues_mxfp4[vui2 & 0xF] * d));
-            store_a(col, row + 8, FLOAT_TYPEV2(kvalues_mxfp4[vui  >>  4] * d,
-                                              kvalues_mxfp4[vui2 >>  4] * d));
+            // ---------------------------------------------------------------------------
+            // MXFP4 magnitude table: nibble bits[2:0] → {0,1,2,3,4,6,8,12} packed as
+            // 4-bit fields in a uint32 (nibble 0 in bits [3:0], nibble 7 in bits [31:28]).
+            // Decode: mag = bitfieldExtract(MXFP4_LUT, int((nibble & 7u) << 2), 4)
+            //         val = float(mag) * ((nibble >= 8u) ? -d : d)
+            // ---------------------------------------------------------------------------
+            const uint MXFP4_LUT = 0xC8643210u;
+#define MXFP4_VAL(nibble, scale) (float(bitfieldExtract(MXFP4_LUT, int(((nibble) & 7u) << 2), 4)) * (((nibble) >= 8u) ? -(scale) : (scale)))
+            store_a(col, row,     FLOAT_TYPEV2(MXFP4_VAL(vui  & 0xF, d),
+                                                MXFP4_VAL(vui2 & 0xF, d)));
+            store_a(col, row + 8, FLOAT_TYPEV2(MXFP4_VAL(vui  >> 4,  d),
+                                                MXFP4_VAL(vui2 >> 4,  d)));
 #endif
 #elif defined(DATA_A_NVFP4)
             const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;

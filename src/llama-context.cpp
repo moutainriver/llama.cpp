@@ -1,6 +1,7 @@
 #include "llama-context.h"
 
 #include "ggml.h"
+#include "ggml-backend.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
 #include "llama-impl.h"
@@ -265,6 +266,24 @@ llama_context::llama_context(
                 const int n_samplers = llama_sampler_chain_n(config.sampler);
 
                 LLAMA_LOG_INFO("%s: setting backend sampler for seq_id %d (n = %d)\n", __func__, config.seq_id, n_samplers);
+            }
+        }
+    }
+
+    // For MoE models with flash attention on Intel Xe2, raise n_ubatch to 2048.
+    if (cparams.flash_attn && hparams.n_expert > 1 && cparams.n_ubatch < 2048) {
+        auto * vk_reg = ggml_backend_reg_by_name("Vulkan");
+        if (vk_reg) {
+            using is_intel_xe2_fn_t = bool (*)(int);
+            auto is_intel_xe2_fn = (is_intel_xe2_fn_t) ggml_backend_reg_get_proc_address(vk_reg, "ggml_backend_vk_is_intel_xe2");
+            if (is_intel_xe2_fn) {
+                int n = (int) ggml_backend_reg_dev_count(vk_reg);
+                for (int i = 0; i < n; i++) {
+                    if (is_intel_xe2_fn(i)) {
+                        cparams.n_ubatch = std::min(cparams.n_batch, 2048u);
+                        break;
+                    }
+                }
             }
         }
     }
